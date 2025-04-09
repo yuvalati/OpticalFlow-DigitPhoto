@@ -2,131 +2,117 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torchvision.transforms as T
-import os
+import torch.nn.functional as F
 
-# Import your custom dataset
-from dataset import MovingObjectDisparityDataset
+# Import our custom dataset
+from dataset import FlowDataset
 
-##############################################################################
-# 1. DEFINE A SIMPLIFIED FLOWNET-SIMPLE MODEL
-##############################################################################
+
 class FlowNetSimple(nn.Module):
     """
-    A mini version of FlowNetSimple that:
-      - Stacks im0 and im1 along the channel dimension -> 6 input channels.
-      - Uses a contractive encoder to shrink spatial size but expand feature depth.
-      - Uses upconvolutions to expand back to a prediction of the same spatial size.
-      - Predicts a 1-channel 'disparity' (or 2-channel flow in real FlowNet).
+    A simplified FlowNetSimple architecture:
+      - We stack im0 and im1 along the channel axis: input shape = (6,H,W).
+      - Then do a series of conv layers with stride 2 in some of them.
+      - Finally predict a 1-channel or 2-channel output (here 1 for 'disp0').
     """
 
-    def __init__(self):
-        super(FlowNetSimple, self).__init__()
-        # Here we define only a few layers to keep it short.
-        # The original FlowNetSimple from the paper is deeper.
-        # Input = 6 channels (RGB im0 + RGB im1)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3),  # downsample
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2), # downsample
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=5, stride=2, padding=2),# downsample
-            nn.ReLU(inplace=True)
-        )
+    def __init__(self, output_channels=1):
+        super().__init__()
+        # output_channels=1 if you only want a single disparity channel,
+        # or =2 if you want 2D optical flow.
 
-        # A simple upconvolution path back to ~1/2 original scale
-        # Real FlowNet would do multiple upconvs + skip connections
-        self.decoder_upconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
+        # Convolutional encoder part
+        # (kernel_size, stride, padding) follows the original FlowNet style
+        # but simplified a bit.
 
-        # Final output layer (assuming final size is 1/2 the input dimension).
-        # If you need the exact original W,H, do another upconv or simply
-        # upsample with interpolation.
-        self.predict_disparity = nn.Conv2d(64, 1, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2)
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=5, stride=2, padding=2)
+        self.conv4 = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)
+        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)
+
+        # A simple "head" that outputs our final flow/disparity
+        self.predict_flow = nn.Conv2d(512, output_channels, kernel_size=3, stride=1, padding=1)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, im0, im1):
         """
-        Inputs:
-          im0, im1 are [B,3,H,W] each
-        Return:
-          disp of shape [B,1,H/2,W/2] in this simplified version.
+        im0, im1: [B,3,H,W] each
+        We'll stack them to get input shape [B,6,H,W].
+        Returns a single-channel or 2-channel predicted flow map [B, outC, H/32, W/32].
         """
-        # Stack along channel dimension
-        x = torch.cat((im0, im1), dim=1)  # shape = [B,6,H,W]
+        x = torch.cat([im0, im1], dim=1)  # shape [B, 6, H, W]
 
-        # Encode
-        x = self.encoder(x)               # shape roughly [B,256,H/8,W/8]
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
+        x = F.relu(self.conv5(x))
 
-        # Decode
-        x = self.decoder_upconv(x)        # shape roughly [B,64,H/2,W/2]
+        flow = self.predict_flow(x)
+        return flow
 
-        # Predict 1-channel disparity
-        disp = self.predict_disparity(x)  # shape [B,1,H/2,W/2]
-        return disp
 
-##############################################################################
-# 2. TRAINING LOOP
-##############################################################################
-def train_flownet_simple():
-    # Basic hyperparameters
-    batch_size = 2
-    num_epochs = 10
-    learning_rate = 1e-4
-
-    # Paths
-    dataset_root = 'dataset'
-
-    # Create dataset and loader
-    train_dataset = MovingObjectDisparityDataset(root_dir=dataset_root,
-                                                 use_disp_name='disp0')
-    print("Length of dataset:", len(train_dataset))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, num_workers=4, drop_last=True)
-
-    # Instantiate the model
-    model = FlowNetSimple().cuda()
-
-    # Define an optimizer and a simple L1 loss (or MSE)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.L1Loss()
-
-    # Training
+def train_one_epoch(model, dataloader, optimizer, device='cuda'):
     model.train()
+    total_loss = 0.0
+
+    for batch_idx, sample in enumerate(dataloader):
+        im0 = sample['im0'].to(device)  # [B,3,H,W]
+        im1 = sample['im1'].to(device)  # [B,3,H,W]
+        disp0_gt = sample['disp0'].to(device)  # [B,1,H,W] (our "ground truth")
+
+        # Forward
+        pred = model(im0, im1)
+        # pred shape is [B,1,H_out,W_out], typically smaller in spatial dims than input.
+        # If your net downsamples by factor 32, you may want to downsample disp0_gt to match it:
+        B, _, H_out, W_out = pred.shape
+        disp0_down = F.interpolate(disp0_gt, size=(H_out, W_out), mode='nearest')
+
+        # Example L1 loss:
+        loss = F.l1_loss(pred, disp0_down)
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+
+def main():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 1) Create dataset & loader
+    dataset_path = './Dataset'
+    train_ds = FlowDataset(root_dir=dataset_path)
+    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=0)
+
+    # 2) Create model & optimizer
+    model = FlowNetSimple(output_channels=1).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    # 3) Train loop
+    num_epochs = 5
     for epoch in range(num_epochs):
-        running_loss = 0.0
-        for i, sample in enumerate(train_loader):
-            im0 = sample['im0'].cuda()   # [B,3,H,W]
-            im1 = sample['im1'].cuda()   # [B,3,H,W]
-            disp_gt = sample['disp'].cuda()  # [B,1,H,W] or [B,H,W]
+        avg_loss = train_one_epoch(model, train_loader, optimizer, device=device)
+        print(f"Epoch [{epoch + 1}/{num_epochs}] - Loss: {avg_loss:.4f}")
 
-            # Forward
-            disp_pred = model(im0, im1)  # [B,1,H/2,W/2] in this simplified example
+    # Done. You can now do further validation or save your model.
+    # e.g. torch.save(model.state_dict(), 'flownet_simple.pth')
 
-            # You may need to downsample disp_gt to match the shape:
-            _, _, predH, predW = disp_pred.shape
-            disp_gt_resized = torch.nn.functional.interpolate(disp_gt, size=(predH, predW),
-                                                              mode='bilinear', align_corners=False)
-
-            loss = criterion(disp_pred, disp_gt_resized)
-
-            # Backprop
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-        epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
-
-    # Save model
-    os.makedirs('checkpoints', exist_ok=True)
-    torch.save(model.state_dict(), 'checkpoints/flownet_simple.pth')
-    print("Model saved to checkpoints/flownet_simple.pth.")
 
 if __name__ == '__main__':
-    train_flownet_simple()
+    main()
+
