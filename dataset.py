@@ -1,17 +1,14 @@
 import os
 import glob
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
 
 class FlowDataset(Dataset):
     """
-    A custom Dataset that loads image pairs and their corresponding disp0 ground truth.
-    Assumes:
-      - images/ contains *_im0.png and *_im1.png
-      - GT/ contains *_disp0.jpg
+    A custom Dataset that loads image pairs (im0, im1) and their corresponding disp0 ground truth,
+    then crops them to match the smallest H,W across the entire dataset.
     """
 
     def __init__(self, root_dir, transform=None):
@@ -41,13 +38,36 @@ class FlowDataset(Dataset):
             # Construct the GT path for disp0 (JPG!)
             disp_path = os.path.join(self.gt_dir, f"{pair_prefix}_disp0.jpg")
 
-            # Check that im1 & disp0 exist
             if os.path.isfile(im1_path) and os.path.isfile(disp_path):
                 self.samples.append((im0_path, im1_path, disp_path))
-            else:
-                # You can print a warning if you like
-                # print(f"Missing pair or GT for {im0_path}: {im1_path}, {disp_path}")
-                pass
+
+        # 2) Figure out the smallest (height, width) among all images in the dataset
+        self.min_h = float('inf')
+        self.min_w = float('inf')
+
+        for (im0_path, im1_path, disp_path) in self.samples:
+            # Check each file's size
+            with Image.open(im0_path) as im0:
+                w, h = im0.size  # Pillow returns (width, height)
+                if h < self.min_h: self.min_h = h
+                if w < self.min_w: self.min_w = w
+
+            with Image.open(im1_path) as im1:
+                w, h = im1.size
+                if h < self.min_h: self.min_h = h
+                if w < self.min_w: self.min_w = w
+
+            with Image.open(disp_path) as disp0:
+                w, h = disp0.size
+                if h < self.min_h: self.min_h = h
+                if w < self.min_w: self.min_w = w
+
+        # For convenience, store the final target size as integers
+        self.target_h = int(self.min_h)
+        self.target_w = int(self.min_w)
+
+        print(f"--> Found {len(self.samples)} valid pairs.")
+        print(f"--> The smallest H,W across all images = ({self.target_h}, {self.target_w}).")
 
     def __len__(self):
         return len(self.samples)
@@ -55,33 +75,47 @@ class FlowDataset(Dataset):
     def __getitem__(self, idx):
         im0_path, im1_path, disp_path = self.samples[idx]
 
-        # Load images
-        im0 = Image.open(im0_path).convert('RGB')
-        im1 = Image.open(im1_path).convert('RGB')
-        disp0 = Image.open(disp_path).convert('L')  # single-channel JPG
+        # Load images with Pillow
+        im0_pil = Image.open(im0_path).convert('RGB')
+        im1_pil = Image.open(im1_path).convert('RGB')
+        disp0_pil = Image.open(disp_path).convert('L')  # single-channel JPG
 
-        # Convert to tensors:  [C,H,W] floating [0..255]
-        im0 = torch.from_numpy(np.array(im0)).float().permute(2, 0, 1)
-        im1 = torch.from_numpy(np.array(im1)).float().permute(2, 0, 1)
-        disp0 = torch.from_numpy(np.array(disp0)).float().unsqueeze(0)  # [1,H,W]
+        # Convert to numpy => then torch
+        im0_t = torch.from_numpy(np.array(im0_pil)).float().permute(2, 0, 1)  # [3,H,W]
+        im1_t = torch.from_numpy(np.array(im1_pil)).float().permute(2, 0, 1)
+        disp0_t = torch.from_numpy(np.array(disp0_pil)).float().unsqueeze(0)   # [1,H,W]
 
         # Normalize images [0..1]
-        im0 /= 255.0
-        im1 /= 255.0
+        im0_t /= 255.0
+        im1_t /= 255.0
+        # If disp0 is in [0..255], scale if needed, e.g. disp0_t /= 16
 
-        # If disp0 is also in [0..255], you might apply a scale factor here
-        # disp0 /= some_factor
+        # 3) Center-crop to (target_h, target_w)
+        im0_t = self._center_crop_tensor(im0_t, self.target_h, self.target_w)
+        im1_t = self._center_crop_tensor(im1_t, self.target_h, self.target_w)
+        disp0_t = self._center_crop_tensor(disp0_t, self.target_h, self.target_w)
 
         sample = {
-            'im0': im0,       # [3,H,W]
-            'im1': im1,       # [3,H,W]
-            'disp0': disp0    # [1,H,W]
+            'im0': im0_t,       # [3, target_h, target_w]
+            'im1': im1_t,       # [3, target_h, target_w]
+            'disp0': disp0_t    # [1, target_h, target_w]
         }
 
         if self.transform:
             sample = self.transform(sample)
 
         return sample
+
+    def _center_crop_tensor(self, tensor_img, crop_h, crop_w):
+        """
+        Given a torch tensor of shape [C,H,W], center-crop it to (crop_h, crop_w).
+        Half the difference is cut from each side in H and W dimensions.
+        """
+        _, H, W = tensor_img.shape
+        # Compute top/left for center
+        top = (H - crop_h) // 2
+        left = (W - crop_w) // 2
+        return tensor_img[:, top:top+crop_h, left:left+crop_w]
 
 def demo_loader(dataset_path):
     ds = FlowDataset(root_dir=dataset_path, transform=None)
@@ -95,6 +129,7 @@ def demo_loader(dataset_path):
         print(f"  im1 shape = {im1.shape}")
         print(f"  disp0 shape = {disp0.shape}")
         break  # just show the first batch
+
 
 if __name__ == '__main__':
     dataset_path = 'dataset'

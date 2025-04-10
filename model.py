@@ -95,7 +95,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # 1) Create dataset & loader
-    dataset_path = './Dataset'
+    dataset_path = 'dataset'
     train_ds = FlowDataset(root_dir=dataset_path)
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=0)
 
