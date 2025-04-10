@@ -7,8 +7,12 @@ import numpy as np
 
 class FlowDataset(Dataset):
     """
-    A custom Dataset that loads image pairs (im0, im1) and their corresponding disp0 ground truth,
-    then crops them to match the smallest H,W across the entire dataset.
+    A custom Dataset that:
+      1) Finds all valid (im0, im1, disp0) triplets.
+      2) Determines the smallest (height, width) across the entire dataset.
+      3) For each triplet, center-crops them to (target_h, target_w).
+      4) Splits that cropped region into 4 quadrants (top-left, top-right, bottom-left, bottom-right).
+         Each quadrant is returned as a separate sample in the dataset.
     """
 
     def __init__(self, root_dir, transform=None):
@@ -41,14 +45,14 @@ class FlowDataset(Dataset):
             if os.path.isfile(im1_path) and os.path.isfile(disp_path):
                 self.samples.append((im0_path, im1_path, disp_path))
 
-        # 2) Figure out the smallest (height, width) among all images in the dataset
+        # 2) Figure out the smallest (height, width) among all images
         self.min_h = float('inf')
         self.min_w = float('inf')
 
         for (im0_path, im1_path, disp_path) in self.samples:
             # Check each file's size
             with Image.open(im0_path) as im0:
-                w, h = im0.size  # Pillow returns (width, height)
+                w, h = im0.size  # Pillow: (width, height)
                 if h < self.min_h: self.min_h = h
                 if w < self.min_w: self.min_w = w
 
@@ -62,43 +66,63 @@ class FlowDataset(Dataset):
                 if h < self.min_h: self.min_h = h
                 if w < self.min_w: self.min_w = w
 
-        # For convenience, store the final target size as integers
+        # The final target crop size
         self.target_h = int(self.min_h)
         self.target_w = int(self.min_w)
 
         print(f"--> Found {len(self.samples)} valid pairs.")
         print(f"--> The smallest H,W across all images = ({self.target_h}, {self.target_w}).")
 
+        # Because we split each sample into 4 sub-samples,
+        # the effective length is 4 * len(self.samples).
+        self.total_subsamples = 4 * len(self.samples)
+
     def __len__(self):
-        return len(self.samples)
+        # Return 4x the number of original triplets
+        return self.total_subsamples
 
     def __getitem__(self, idx):
-        im0_path, im1_path, disp_path = self.samples[idx]
+        """
+        We'll interpret idx as:
+          base_idx = idx // 4  (which of the original pairs)
+          sub_idx  = idx % 4   (which quadrant)
+        """
+        base_idx = idx // 4
+        sub_idx  = idx % 4
 
-        # Load images with Pillow
+        im0_path, im1_path, disp_path = self.samples[base_idx]
+
+        # Load images
         im0_pil = Image.open(im0_path).convert('RGB')
         im1_pil = Image.open(im1_path).convert('RGB')
         disp0_pil = Image.open(disp_path).convert('L')  # single-channel JPG
 
-        # Convert to numpy => then torch
-        im0_t = torch.from_numpy(np.array(im0_pil)).float().permute(2, 0, 1)  # [3,H,W]
+        # Convert to torch tensors: [C, H, W]
+        im0_t = torch.from_numpy(np.array(im0_pil)).float().permute(2, 0, 1)
         im1_t = torch.from_numpy(np.array(im1_pil)).float().permute(2, 0, 1)
-        disp0_t = torch.from_numpy(np.array(disp0_pil)).float().unsqueeze(0)   # [1,H,W]
+        disp0_t = torch.from_numpy(np.array(disp0_pil)).float().unsqueeze(0)  # [1, H, W]
 
-        # Normalize images [0..1]
+        # Scale images [0..1]
         im0_t /= 255.0
         im1_t /= 255.0
-        # If disp0 is in [0..255], scale if needed, e.g. disp0_t /= 16
+        # If disp0 is [0..255], scale if needed:
+        # disp0_t /= 16  (example)
 
-        # 3) Center-crop to (target_h, target_w)
+        # 1) Center-crop to (target_h, target_w)
         im0_t = self._center_crop_tensor(im0_t, self.target_h, self.target_w)
         im1_t = self._center_crop_tensor(im1_t, self.target_h, self.target_w)
         disp0_t = self._center_crop_tensor(disp0_t, self.target_h, self.target_w)
 
+        # 2) Split that crop into 4 quadrants
+        # We'll define a helper to do the quadrant cut
+        im0_sub = self._get_quadrant(im0_t, sub_idx)
+        im1_sub = self._get_quadrant(im1_t, sub_idx)
+        disp0_sub = self._get_quadrant(disp0_t, sub_idx)
+
         sample = {
-            'im0': im0_t,       # [3, target_h, target_w]
-            'im1': im1_t,       # [3, target_h, target_w]
-            'disp0': disp0_t    # [1, target_h, target_w]
+            'im0': im0_sub,    # shape [3, H/2, W/2] or close
+            'im1': im1_sub,
+            'disp0': disp0_sub
         }
 
         if self.transform:
@@ -109,27 +133,55 @@ class FlowDataset(Dataset):
     def _center_crop_tensor(self, tensor_img, crop_h, crop_w):
         """
         Given a torch tensor of shape [C,H,W], center-crop it to (crop_h, crop_w).
-        Half the difference is cut from each side in H and W dimensions.
         """
         _, H, W = tensor_img.shape
-        # Compute top/left for center
         top = (H - crop_h) // 2
         left = (W - crop_w) // 2
         return tensor_img[:, top:top+crop_h, left:left+crop_w]
 
+    def _get_quadrant(self, tensor_img, sub_idx):
+        """
+        Given a [C,H,W] tensor (the center-cropped region),
+        return one of the four quadrants (top-left, top-right,
+        bottom-left, bottom-right) based on sub_idx in {0,1,2,3}.
+
+        We'll do integer floor division to define the sub-crop.
+
+        sub_idx:
+          0 -> top-left
+          1 -> top-right
+          2 -> bottom-left
+          3 -> bottom-right
+        """
+        _, H, W = tensor_img.shape
+        half_h = H // 2
+        half_w = W // 2
+
+        if sub_idx == 0:
+            # top-left
+            return tensor_img[:, 0:half_h, 0:half_w]
+        elif sub_idx == 1:
+            # top-right
+            return tensor_img[:, 0:half_h, half_w:W]
+        elif sub_idx == 2:
+            # bottom-left
+            return tensor_img[:, half_h:H, 0:half_w]
+        else:
+            # bottom-right
+            return tensor_img[:, half_h:H, half_w:W]
+
 def demo_loader(dataset_path):
     ds = FlowDataset(root_dir=dataset_path, transform=None)
-    print("Number of samples found:", len(ds))
+    print("Number of total sub-samples (4x each pair):", len(ds))
 
     loader = DataLoader(ds, batch_size=2, shuffle=True, num_workers=0)
     for batch_idx, sample in enumerate(loader):
         im0, im1, disp0 = sample['im0'], sample['im1'], sample['disp0']
         print(f"Batch {batch_idx}:")
-        print(f"  im0 shape = {im0.shape}  (B,C,H,W)")
+        print(f"  im0 shape = {im0.shape}  (B,C,H_sub,W_sub)")
         print(f"  im1 shape = {im1.shape}")
         print(f"  disp0 shape = {disp0.shape}")
         break  # just show the first batch
-
 
 if __name__ == '__main__':
     dataset_path = 'dataset'

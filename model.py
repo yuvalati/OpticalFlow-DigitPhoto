@@ -104,7 +104,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     # 3) Train loop
-    num_epochs = 5
+    num_epochs = 20
     for epoch in range(num_epochs):
         avg_loss = train_one_epoch(model, train_loader, optimizer, device=device)
         print(f"Epoch [{epoch + 1}/{num_epochs}] - Loss: {avg_loss:.4f}")
