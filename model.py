@@ -1,118 +1,142 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
+# model.py
 
-# Import our custom dataset
+import os
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+import tensorflow as tf
+from tensorflow import keras
+from keras import layers
+
 from dataset import FlowDataset
 
 
-class FlowNetSimple(nn.Module):
+##############################################################################
+# 1) Load dataset => X is [N,H,W,6], Y is [N,H/4,W/4,1], from your final dataset code
+##############################################################################
+
+def load_dataset_into_numpy(dataset_path):
+    ds = FlowDataset(root_dir=dataset_path, transform=None)
+    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
+
+    X_list, Y_list = [], []
+    for sample in loader:
+        im0 = sample['im0'][0].numpy()      # [3,H,W]
+        im1 = sample['im1'][0].numpy()      # [3,H,W]
+        disp0 = sample['disp0'][0].numpy()  # [1,H/4,W/4]
+
+        # (H,W,6)
+        stacked = np.concatenate([im0, im1], axis=0)  # [6,H,W]
+        stacked = np.transpose(stacked, (1,2,0))       # => [H,W,6]
+
+        # (H/4,W/4,1)
+        disp0 = np.transpose(disp0, (1,2,0))
+
+        X_list.append(stacked.astype(np.float32))
+        Y_list.append(disp0.astype(np.float32))
+
+    X = np.array(X_list, dtype=np.float32)  # [N,H,W,6]
+    Y = np.array(Y_list, dtype=np.float32)  # [N,H/4,W/4,1]
+    print("X.shape:", X.shape, "Y.shape:", Y.shape)
+    return X, Y
+
+
+##############################################################################
+# 2) A small layer that: (a) slices the upsampled feature to match the skip,
+#    (b) concatenates them along the channels axis.  Fixes shape mismatches.
+##############################################################################
+
+def crop_and_concat(up, skip):
     """
-    A simplified FlowNetSimple architecture:
-      - We stack im0 and im1 along the channel axis: input shape = (6,H,W).
-      - Then do a series of conv layers with stride 2 in some of them.
-      - Finally predict a 1-channel or 2-channel output (here 1 for 'disp0').
+    Receives 2 Keras symbolic tensors: up, skip
+      - up might be (None, H_up, W_up, C_up)
+      - skip might be (None, H_skip, W_skip, C_skip)
+    Slices 'up' so [H_up, W_up] -> [H_skip, W_skip] if H_up>H_skip, W_up>W_skip
+    Returns concatenated along axis=-1
     """
+    def layer_func(tensors):
+        up, skip = tensors
+        sh = tf.shape(skip)[1]
+        sw = tf.shape(skip)[2]
+        # slice up
+        up = up[:, :sh, :sw, :]
+        return tf.concat([up, skip], axis=-1)
 
-    def __init__(self, output_channels=1):
-        super().__init__()
-        # output_channels=1 if you only want a single disparity channel,
-        # or =2 if you want 2D optical flow.
-
-        # Convolutional encoder part
-        # (kernel_size, stride, padding) follows the original FlowNet style
-        # but simplified a bit.
-
-        self.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2)
-        self.conv3 = nn.Conv2d(128, 256, kernel_size=5, stride=2, padding=2)
-        self.conv4 = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)
-        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)
-
-        # A simple "head" that outputs our final flow/disparity
-        self.predict_flow = nn.Conv2d(512, output_channels, kernel_size=3, stride=1, padding=1)
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, im0, im1):
-        """
-        im0, im1: [B,3,H,W] each
-        We'll stack them to get input shape [B,6,H,W].
-        Returns a single-channel or 2-channel predicted flow map [B, outC, H/32, W/32].
-        """
-        x = torch.cat([im0, im1], dim=1)  # shape [B, 6, H, W]
-
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = F.relu(self.conv5(x))
-
-        flow = self.predict_flow(x)
-        return flow
+    return layers.Lambda(layer_func)([up, skip])
 
 
-def train_one_epoch(model, dataloader, optimizer, device='cuda'):
-    model.train()
-    total_loss = 0.0
+##############################################################################
+# 3) FlowNetSimple with 6 downsamples, 4 up.  Each skip uses crop_and_concat.
+##############################################################################
 
-    for batch_idx, sample in enumerate(dataloader):
-        im0 = sample['im0'].to(device)  # [B,3,H,W]
-        im1 = sample['im1'].to(device)  # [B,3,H,W]
-        disp0_gt = sample['disp0'].to(device)  # [B,1,H,W] (our "ground truth")
+def build_flownet_simple(input_shape=(384, 512, 6), output_channels=1):
+    inputs = keras.Input(shape=input_shape)
 
-        # Forward
-        pred = model(im0, im1)
-        # pred shape is [B,1,H_out,W_out], typically smaller in spatial dims than input.
-        # If your net downsamples by factor 32, you may want to downsample disp0_gt to match it:
-        B, _, H_out, W_out = pred.shape
-        disp0_down = F.interpolate(disp0_gt, size=(H_out, W_out), mode='nearest')
+    # -- encoder
+    conv1 = layers.Conv2D(64, 7, strides=2, padding='same', activation='relu')(inputs)
+    conv2 = layers.Conv2D(128,5, strides=2, padding='same', activation='relu')(conv1)
+    conv3 = layers.Conv2D(256,5, strides=2, padding='same', activation='relu')(conv2)
+    conv3_1 = layers.Conv2D(256,3, strides=1, padding='same', activation='relu')(conv3)
+    conv4 = layers.Conv2D(512,3, strides=2, padding='same', activation='relu')(conv3_1)
+    conv4_1 = layers.Conv2D(512,3, strides=1, padding='same', activation='relu')(conv4)
+    conv5 = layers.Conv2D(512,3, strides=2, padding='same', activation='relu')(conv4_1)
+    conv5_1 = layers.Conv2D(512,3, strides=1, padding='same', activation='relu')(conv5)
+    conv6 = layers.Conv2D(1024,3,strides=2, padding='same', activation='relu')(conv5_1)
 
-        # Example L1 loss:
-        loss = F.l1_loss(pred, disp0_down)
+    # -- partial decoder
+    up5 = layers.Conv2DTranspose(512,4,strides=2,padding='same',activation='relu')(conv6)
+    skip5 = crop_and_concat(up5, conv5_1)
 
-        # Backward
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    up4 = layers.Conv2DTranspose(256,4,strides=2,padding='same',activation='relu')(skip5)
+    skip4 = crop_and_concat(up4, conv4_1)
 
-        total_loss += loss.item()
+    up3 = layers.Conv2DTranspose(128,4,strides=2,padding='same',activation='relu')(skip4)
+    skip3 = crop_and_concat(up3, conv3_1)
 
-    return total_loss / len(dataloader)
+    up2 = layers.Conv2DTranspose(64,4,strides=2,padding='same',activation='relu')(skip3)
+    skip2 = crop_and_concat(up2, conv2)
 
+    # final => shape ~ [batch, H/4, W/4, 1]
+    prediction = layers.Conv2D(output_channels,3,padding='same',activation='linear')(skip2)
+
+    model = keras.Model(inputs, prediction, name='FlowNetSimple')
+    return model
+
+
+##############################################################################
+# 4) Train & Evaluate
+##############################################################################
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    dataset_path = "dataset"
+    X, Y = load_dataset_into_numpy(dataset_path)  # X: [N,H,W,6], Y: [N,H/4,W/4,1]
 
-    # 1) Create dataset & loader
-    dataset_path = 'dataset'
-    train_ds = FlowDataset(root_dir=dataset_path)
-    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=0)
+    _, H, W, C = X.shape
+    model = build_flownet_simple(
+        input_shape=(H, W, C),
+        output_channels=1
+    )
+    model.summary()
 
-    # 2) Create model & optimizer
-    model = FlowNetSimple(output_channels=1).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    # For single-channel, you can do "mae" or a custom EPE
+    def endpoint_error(y_true, y_pred):
+        return tf.reduce_mean(tf.abs(y_true - y_pred))
 
-    # 3) Train loop
-    num_epochs = 20
-    for epoch in range(num_epochs):
-        avg_loss = train_one_epoch(model, train_loader, optimizer, device=device)
-        print(f"Epoch [{epoch + 1}/{num_epochs}] - Loss: {avg_loss:.4f}")
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-4),
+        loss="mae",
+        metrics=[endpoint_error]
+    )
 
-    # Done. You can now do further validation or save your model.
-    # e.g. torch.save(model.state_dict(), 'flownet_simple.pth')
+    model.fit(
+        X, Y,
+        batch_size=2,
+        epochs=5,
+    )
 
+    results = model.evaluate(X, Y)
+    print("Evaluation:", results)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
