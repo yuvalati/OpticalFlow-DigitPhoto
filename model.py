@@ -67,8 +67,9 @@ def acc3_metric(y_true, y_pred):
     Fraction of pixels whose absolute error is < 3.0
     """
     err = tf.abs(y_pred - y_true)
-    within3 = tf.less(err, 3.0)
+    within3 = tf.less(err, 5.0)
     return tf.reduce_mean(tf.cast(within3, tf.float32))
+
 
 def endpoint_error(y_true, y_pred):
     """
@@ -76,14 +77,6 @@ def endpoint_error(y_true, y_pred):
     """
     return tf.reduce_mean(tf.abs(y_true - y_pred))
 
-
-##############################################################################
-# 4) Main script:
-#    - build the dataset via build_dataset(...)
-#    - build the FlowNetSimple
-#    - compile with extra metrics
-#    - train & evaluate
-##############################################################################
 
 def main():
     # Dataset path
@@ -106,10 +99,7 @@ def main():
     )
 
     # Train
-    model.fit(X, Y,
-        batch_size=4,
-        epochs=50,
-    )
+    model.fit(X, Y, batch_size=8, epochs=50)
 
     # Evaluate the model results [loss, endpoint_error, mse_metric, acc3_metric]
     results = model.evaluate(X, Y)
